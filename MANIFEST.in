@@ -1,0 +1,5 @@
+graft itmpl
+global-exclude *.py[cod]
+include pyproject.toml
+include setup.py
+include requirements.txt
