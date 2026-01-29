@@ -1,0 +1,18 @@
+[project]
+name = 'wtmpl'
+dynamic = ['version']
+description = 'An easier to use directory templating tool. Inspired by itmpl.'
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+# [project.scripts]
+# wtmpl = "wtmpl.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/wtmpl/_version.py"
+pattern = '__version__(?:: str)? *= *\"(?P<version>[^\"]+)\"'
