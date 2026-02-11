@@ -1,0 +1,13 @@
+{
+	"configurations": [
+		{
+			"name": "Debug wtmpl CLI",
+			"type": "debugpy",
+			"request": "launch",
+			"module": "wtmpl",
+			"args": ["new", "-d", "node", "node-test"],
+			"cwd": "${workspaceFolder}",
+			"justMyCode": false
+		}
+	]
+}
