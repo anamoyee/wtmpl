@@ -1,9 +1,13 @@
 import abc
+import os
 import pathlib as p
 import re
+import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
+from mimetypes import suffix_map
+from types import CodeType
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 import rich
@@ -16,11 +20,14 @@ from .util import iter_subpath_chain, ls_char, pathlib_os_walk
 
 class _TriggerSequenceABC(abc.ABC):
 	@abc.abstractmethod
-	def build_patterns(self, escaped_default_brace_pair: tuple[str, str]) -> Iterable[re.Pattern]: ...
+	def build_enter_exit_patterns(self, escaped_default_brace_pair: tuple[str, str]) -> Iterable[tuple[re.Pattern, re.Pattern]]: ...
 
 	@staticmethod
-	def merged_braces_to_pattern(brace_l: str, brace_r: str) -> re.Pattern:
-		return re.compile(f"{brace_l}(?P<is_exec>!?)\\s?(?P<expr>(?:(?!{brace_l}).)*?)\\s?{brace_r}", re.DOTALL)
+	def merged_braces_to_enter_exit_pair(brace_l: str, brace_r: str) -> tuple[re.Pattern, re.Pattern]:
+		return (
+			re.compile(f"{brace_l}(?P<is_exec>!?)"),
+			re.compile(f"{brace_r}"),
+		)
 
 	def __iter__(self) -> Iterator[Self]:
 		return iter((self,))  # implement shorthand for `overrides={".py": self}` instead of having to do `{".py": [self]}`
@@ -33,7 +40,7 @@ class LineCommentTriggerSequence(_TriggerSequenceABC):
 	optional_language_specific_part: bool = field(kw_only=True, default=False)
 	optional_whitespace_between_parts: bool = field(kw_only=True, default=True)
 
-	def _line_comment(self, *, escaped_default_brace_pair: tuple[str, str]) -> re.Pattern:
+	def _line_comment(self, *, escaped_default_brace_pair: tuple[str, str]) -> tuple[re.Pattern, re.Pattern]:
 		"""Given the non-`re.escaped` param: `start` of a programming language's line comment start sequence, return a `re.Pattern` which matches the wtmpl expression in this language."""
 		default_brace_escaped_l, default_brace_escaped_r = escaped_default_brace_pair
 
@@ -51,9 +58,9 @@ class LineCommentTriggerSequence(_TriggerSequenceABC):
 			# the latter if the expr doesnt, and/or it's possible to end the expr without starting another language comment
 		)
 
-		return self.merged_braces_to_pattern(brace_l, brace_r)
+		return self.merged_braces_to_enter_exit_pair(brace_l, brace_r)
 
-	def build_patterns(self, escaped_default_brace_pair: tuple[str, str]) -> Iterable[re.Pattern]:
+	def build_enter_exit_patterns(self, escaped_default_brace_pair: tuple[str, str]) -> list[tuple[re.Pattern, re.Pattern]]:
 		return [self._line_comment(escaped_default_brace_pair=escaped_default_brace_pair)]
 
 
@@ -65,7 +72,7 @@ class BlockCommentTriggerSequence(_TriggerSequenceABC):
 	optional_language_specific_part: bool = field(kw_only=True, default=False)
 	optional_whitespace_between_parts: bool = field(kw_only=True, default=True)
 
-	def _block_comment(self, *, escaped_default_brace_pair: tuple[str, str]) -> re.Pattern:
+	def _block_comment(self, *, escaped_default_brace_pair: tuple[str, str]) -> tuple[re.Pattern, re.Pattern]:
 		"""Given the non-`re.escaped` params: `start` and `end` of a programming language's block comment start and end sequences, return a `re.Pattern` which matches the wtmpl expression in this language."""
 		default_brace_escaped_l, default_brace_escaped_r = escaped_default_brace_pair
 
@@ -82,9 +89,9 @@ class BlockCommentTriggerSequence(_TriggerSequenceABC):
 			# '}}-->'
 		)
 
-		return self.merged_braces_to_pattern(brace_l, brace_r)
+		return self.merged_braces_to_enter_exit_pair(brace_l, brace_r)
 
-	def build_patterns(self, escaped_default_brace_pair: tuple[str, str]) -> Iterable[re.Pattern]:
+	def build_enter_exit_patterns(self, escaped_default_brace_pair: tuple[str, str]) -> Iterable[tuple[re.Pattern, re.Pattern]]:
 		return [self._block_comment(escaped_default_brace_pair=escaped_default_brace_pair)]
 
 
@@ -128,17 +135,17 @@ def wtmpl_eval(
 		k: [
 			pattern  #
 			for ts in v
-			for pattern in ts.build_patterns(escaped_default_brace_pair)
+			for pattern in ts.build_enter_exit_patterns(escaped_default_brace_pair)
 		]
 		for k, v in suffix_to_trigger_sequence_builders_lookup.items()
 	}
 
 	if suffix is None:
-		patterns = LineCommentTriggerSequence("").build_patterns(escaped_default_brace_pair)
+		patterns = LineCommentTriggerSequence("").build_enter_exit_patterns(escaped_default_brace_pair)
 	elif suffix in lang_to_pattern_lookup:
 		patterns = lang_to_pattern_lookup[suffix]
 	else:
-		patterns = LineCommentTriggerSequence("#").build_patterns(escaped_default_brace_pair)
+		patterns = LineCommentTriggerSequence("#").build_enter_exit_patterns(escaped_default_brace_pair)
 
 	def _setup_exec_dict() -> dict[str, Any]:
 
@@ -158,6 +165,8 @@ def wtmpl_eval(
 		return {
 			"imp": ShorthandImporter(),
 		}
+
+	1 - 1  # to do: this function is now dead code
 
 	def repl_fn(m: re.Match[str], *, exec_dict: dict[str, Any] = _setup_exec_dict()) -> str:
 		d = m.groupdict()
@@ -194,13 +203,170 @@ def wtmpl_eval(
 
 		return str(retval)
 
-	for pat in patterns:
-		while True:
-			s, n = re.subn(pat, repl_fn, s)
-			if n == 0:
-				break
+	if True:
 
-	return s
+		class Node: ...
+
+		@dataclass
+		class TextNode(Node):
+			text: str
+			span: tuple[int, int]
+
+		@dataclass(kw_only=True)
+		class ExprNode(Node):
+			span: tuple[int, int]
+			groupdict: dict[str, str]
+			children: list[Node]
+
+			def get_expr_text(self, s: str) -> str:
+				return s[slice(*self.span)]
+
+		@dataclass
+		class StackEntry:
+			entering_match_span_end: int
+			groupdict: dict[str, str]
+
+		def _parse(s: str, patterns):
+			# stack of node-lists (this creates the tree)
+			node_stack: list[list[Node]] = [[]]
+
+			# stack of open expression metadata
+			expr_stack: list[StackEntry] = []
+
+			i = 0
+			n = len(s)
+
+			while i < n:
+				matched = False
+
+				for enter_pat, exit_pat in patterns:
+					# ---- ENTER ----
+					if m := re.match(enter_pat, s[i:]):
+						i += m.end()
+
+						expr_stack.append(
+							StackEntry(
+								entering_match_span_end=i,
+								groupdict=m.groupdict(),
+							)
+						)
+
+						# new child node list
+						node_stack.append([])
+
+						matched = True
+						break
+
+					# ---- EXIT ----
+					if m := re.match(exit_pat, s[i:]):
+						if not expr_stack:
+							raise ValueError("Unbalanced braces: closed more than opened")
+
+						entry = expr_stack.pop()
+						children = node_stack.pop()
+
+						expr_span = (entry.entering_match_span_end, i)
+
+						node_stack[-1].append(
+							ExprNode(
+								span=expr_span,
+								groupdict=entry.groupdict,
+								children=children,
+							)
+						)
+
+						i += m.end()
+						matched = True
+						break
+
+				if matched:
+					continue
+
+				# ---- TEXT ----
+				# collect continuous text for efficiency
+				text_start = i
+				while i < n:
+					for enter_pat, exit_pat in patterns:
+						if re.match(enter_pat, s[i:]) or re.match(exit_pat, s[i:]):
+							break
+					else:
+						i += 1
+						continue
+					break
+
+				node_stack[-1].append(
+					TextNode(
+						text=s[text_start:i],
+						span=(text_start, i),
+					)
+				)
+
+			if expr_stack:
+				raise ValueError("Unbalanced braces: left opened at end of string")
+
+			return node_stack[0]
+
+	if True:  # eval & highlight errors
+
+		def compile_synthetic(expr: str, src_path: p.Path, mode: str) -> tuple[p.Path, Callable[[], CodeType]]:
+
+			with tempfile.TemporaryDirectory(prefix="wtmpl-inflight-", delete=False) as dir_strpath:
+				src_path = src_path.resolve()
+
+				tmp_file_path = p.Path(dir_strpath) / src_path.relative_to("/").with_name(f"{src_path.name}.py")
+
+				tmp_file_path.parent.mkdir(parents=True)
+
+				tmp_file_path.write_text(
+					f"# {
+						str(src_path).replace('\b', '\\b')  # could be more of the edge cases but i cant think of any
+					}\n{expr}"
+				)
+
+			return tmp_file_path, lambda: compile(f"\n{expr}", filename=str(tmp_file_path), mode=mode)
+
+		def evaluate_node(node: Node, s: str, exec_dict: dict, src_path: p.Path):
+			if isinstance(node, TextNode):
+				return node.text
+			if isinstance(node, ExprNode):
+				pass  # continue on
+			else:
+				raise TypeError(f"Expected Node subclass, got: {node.__class__!r}")
+
+			rendered_children = [evaluate_node(child, s, exec_dict, src_path) for child in node.children]
+
+			expr_source = "".join(rendered_children).strip()
+
+			d = node.groupdict
+
+			if "is_exec" not in d:
+				raise RuntimeError("BUG: missing 'is_exec'")
+
+			is_exec = bool(d["is_exec"])
+			mode = "exec" if is_exec else "eval"
+
+			tmp_file = None
+
+			try:
+				tmp_file, make_compiled = compile_synthetic(expr_source, src_path, mode)
+
+				if is_exec:
+					exec(make_compiled(), exec_dict, exec_dict)
+					retval = exec_dict.get("_", "")
+				else:
+					retval = eval(make_compiled(), exec_dict, exec_dict)
+
+			except BaseException as e:
+				raise error.TemplateArbitrary.BaseError(e) from e
+			else:
+				if tmp_file is not None:
+					tmp_file.unlink(missing_ok=True)
+
+			return str(retval)
+
+	root_nodes = _parse(s, patterns)
+
+	return "".join(evaluate_node(node, s, _setup_exec_dict(), src_path) for node in root_nodes)
 
 
 if False:  # scrap the merge strategy idea, treat everything as `KEEP_ORIGINAL_AND_WARN` by default (and merge directories). Maybe revive this idea in the future...?
@@ -661,7 +827,7 @@ def instantiate_wtmpl_template(
 							print(header)
 							print("\n".join(f"{indent}{line}" for line in s.split("\n")))
 
-						_print_file_contents(content, header="--- BEFORE EVALUATION ---")
-						_print_file_contents(evaluated_content, header="--- AFTER EVALUATION ---")
+						_print_file_contents(content, header="--- BEFORE ---")
+						_print_file_contents(evaluated_content, header="--- AFTER ---")
 			else:
 				raise FileExistsError(f"Unsupported filetype within template: {src_item_file}")
