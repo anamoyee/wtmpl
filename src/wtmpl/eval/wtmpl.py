@@ -166,43 +166,6 @@ def wtmpl_eval(
 			"imp": ShorthandImporter(),
 		}
 
-	1 - 1  # to do: this function is now dead code
-
-	def repl_fn(m: re.Match[str], *, exec_dict: dict[str, Any] = _setup_exec_dict()) -> str:
-		d = m.groupdict()
-
-		if "is_exec" not in d:
-			raise RuntimeError("BUG: Unable to find the `is_exec` regex named group in match.")
-		if "expr" not in d:
-			raise RuntimeError("BUG: Unable to find the `expr` regex named group in match.")
-
-		is_exec = d["is_exec"]
-		expr = d["expr"]
-
-		compiled = compile(
-			expr,
-			filename=f"{src_path}" if suffix is not None else f"{src_path}::filename",
-			mode="exec" if is_exec else "eval",
-		)
-
-		if is_exec:
-			try:
-				exec(compiled, exec_dict, exec_dict)
-			except BaseException as e:
-				raise error.TemplateArbitrary.BaseError(e) from e
-
-			retval = ""
-
-			if "_" in exec_dict:
-				retval = exec_dict["_"]
-		else:
-			try:
-				retval = eval(compiled, exec_dict, exec_dict)
-			except BaseException as e:
-				raise error.TemplateArbitrary.BaseError(e) from e
-
-		return str(retval)
-
 	if True:
 
 		class Node: ...
