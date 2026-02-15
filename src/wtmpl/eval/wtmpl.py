@@ -19,7 +19,7 @@ from . import error
 from .util import iter_subpath_chain, ls_char, pathlib_os_walk
 
 
-class _TriggerSequenceABC(abc.ABC):
+class TriggerSequenceABC(abc.ABC):
 	@abc.abstractmethod
 	def build_enter_exit_patterns(self, escaped_default_brace_pair: tuple[str, str]) -> Iterable[tuple[re.Pattern, re.Pattern]]: ...
 
@@ -35,7 +35,7 @@ class _TriggerSequenceABC(abc.ABC):
 
 
 @dataclass
-class LineCommentTriggerSequence(_TriggerSequenceABC):
+class LineCommentTriggerSequence(TriggerSequenceABC):
 	opening: str
 
 	optional_language_specific_part: bool = field(kw_only=True, default=False)
@@ -66,7 +66,7 @@ class LineCommentTriggerSequence(_TriggerSequenceABC):
 
 
 @dataclass
-class BlockCommentTriggerSequence(_TriggerSequenceABC):
+class BlockCommentTriggerSequence(TriggerSequenceABC):
 	opening: str
 	closing: str
 
@@ -96,12 +96,197 @@ class BlockCommentTriggerSequence(_TriggerSequenceABC):
 		return [self._block_comment(escaped_default_brace_pair=escaped_default_brace_pair)]
 
 
+class Parse__(Scope):
+	class Node: ...
+
+	@dataclass
+	class TextNode(Node):
+		text: str
+		span: tuple[int, int]
+
+	@dataclass(kw_only=True)
+	class ExprNode(Node):
+		span: tuple[int, int]
+		groupdict: dict[str, str]
+		children: list[Parse__.Node]
+
+		def get_expr_text(self, s: str) -> str:
+			return s[slice(*self.span)]
+
+	@dataclass
+	class StackEntry:
+		entering_match_span_end: int
+		groupdict: dict[str, str]
+
+	@classmethod
+	def parse(here, s: str, patterns):  # noqa: N804
+		# stack of node-lists (this creates the tree)
+		node_stack: list[list[Parse__.Node]] = [[]]
+
+		# stack of open expression metadata
+		expr_stack: list[Parse__.StackEntry] = []
+
+		i = 0
+		n = len(s)
+
+		while i < n:
+			matched = False
+
+			for enter_pat, exit_pat in patterns:
+				# ---- ENTER ----
+				if m := re.match(enter_pat, s[i:]):
+					i += m.end()
+
+					expr_stack.append(
+						here.StackEntry(
+							entering_match_span_end=i,
+							groupdict=m.groupdict(),
+						)
+					)
+
+					# new child node list
+					node_stack.append([])
+
+					matched = True
+					break
+
+				# ---- EXIT ----
+				if m := re.match(exit_pat, s[i:]):
+					if not expr_stack:
+						raise ValueError("Unbalanced braces: closed more than opened")
+
+					entry = expr_stack.pop()
+					children = node_stack.pop()
+
+					expr_span = (entry.entering_match_span_end, i)
+
+					node_stack[-1].append(
+						here.ExprNode(
+							span=expr_span,
+							groupdict=entry.groupdict,
+							children=children,
+						)
+					)
+
+					i += m.end()
+					matched = True
+					break
+
+			if matched:
+				continue
+
+			# ---- TEXT ----
+			# collect continuous text for efficiency
+			text_start = i
+			while i < n:
+				for enter_pat, exit_pat in patterns:
+					if re.match(enter_pat, s[i:]) or re.match(exit_pat, s[i:]):
+						break
+				else:
+					i += 1
+					continue
+				break
+
+			node_stack[-1].append(
+				here.TextNode(
+					text=s[text_start:i],
+					span=(text_start, i),
+				)
+			)
+
+		if expr_stack:
+			raise ValueError("Unbalanced braces: left opened at end of string")
+
+		return node_stack[0]
+
+
+class Eval__(Scope):
+	@staticmethod
+	def compile_as_tmp_file(expr: str, src_path: p.Path, mode: str) -> tuple[p.Path, CodeType]:
+
+		with tempfile.TemporaryDirectory(prefix="wtmpl-inflight-", delete=False) as dir_strpath:
+			src_path = src_path.resolve()
+
+			tmp_file_path = p.Path(dir_strpath) / src_path.relative_to("/").with_name(f"{src_path.name}.py")
+
+			tmp_file_path.parent.mkdir(parents=True)
+
+			tmp_file_path.write_text(
+				f"# {
+					str(src_path).replace('\b', '\\b')  # could be more of the edge cases but i cant think of any
+				}\n{expr}"
+			)
+
+		return tmp_file_path, compile(f"\n{expr}", filename=str(tmp_file_path), mode=mode)
+
+	@classmethod
+	def evaluate_node(here, node: Parse__.Node, s: str, exec_dict: dict, src_path: p.Path):  # noqa: N804
+		if isinstance(node, Parse__.TextNode):
+			return node.text
+		if isinstance(node, Parse__.ExprNode):
+			pass  # continue on
+		else:
+			raise TypeError(f"Expected Node subclass, got: {node.__class__!r}")
+
+		rendered_children = [here.evaluate_node(child, s, exec_dict, src_path) for child in node.children]
+
+		expr_source = "".join(rendered_children).strip()
+
+		d = node.groupdict
+
+		if "is_exec" not in d:
+			raise RuntimeError("BUG: missing 'is_exec'")
+
+		is_exec = bool(d["is_exec"])
+		mode = "exec" if is_exec else "eval"
+
+		tmp_file = None
+
+		try:
+			tmp_file, compiled = here.compile_as_tmp_file(expr_source, src_path, mode)
+
+			if is_exec:
+				exec(compiled, exec_dict, exec_dict)
+				retval = exec_dict.get("_", "")
+			else:
+				retval = eval(compiled, exec_dict, exec_dict)
+
+		except BaseException as e:
+			raise error.TemplateArbitrary.BaseError(e) from e
+		else:
+			if tmp_file is not None:
+				tmp_file.unlink(missing_ok=True)
+
+		return str(retval)
+
+	class ExecDictItems__(Scope):
+		class ShorthandImporter:
+			def __init__(self, _current_path: tuple[str, ...] = (), /):
+				self.current_path = _current_path
+
+			def __call__(self, *last_minute_path_components: str):
+				return __import__(".".join((*self.current_path, *last_minute_path_components)), fromlist=["*"])
+
+			def __getattr__(self, name: str):
+				return object.__getattribute__(self, "__class__")((*self.current_path, name))
+
+			def __getitem__(self, name: str):
+				return object.__getattribute__(self, "__class__")((*self.current_path, name))
+
+		@classmethod
+		def make(here) -> dict[str, Any]:  # noqa: N804
+
+			return {
+				"imp": here.ShorthandImporter(),
+			}
+
+
 def wtmpl_eval(
 	s: str,
 	*,
 	suffix: str | None,
 	src_path: p.Path,
-	override_language_trigger_sequences: Mapping[str, Iterable[_TriggerSequenceABC]] = {},
+	override_language_trigger_sequences: Mapping[str, Iterable[TriggerSequenceABC]] = {},
 	default_brace_pair: tuple[str, str] = ("{{", "}}"),
 ) -> str:
 	"""Evaluate the given str as a wtmpl expression. The expr braces differ based on the filename, for example in HTML it's `<!--{{ expr }}-->`, in js it's `/*{{ expr }}*/`.
@@ -117,7 +302,7 @@ def wtmpl_eval(
 		re.escape(unescaped_default_brace_r),
 	)
 
-	suffix_to_trigger_sequence_builders_lookup: dict[str, Iterable[_TriggerSequenceABC]] = {
+	suffix_to_trigger_sequence_builders_lookup: dict[str, Iterable[TriggerSequenceABC]] = {
 		".txt": LineCommentTriggerSequence(""),
 		".html": BlockCommentTriggerSequence("<!--{{", "}}-->"),
 		".py": LineCommentTriggerSequence("#", optional_language_specific_part=True),
@@ -135,8 +320,8 @@ def wtmpl_eval(
 	lang_to_pattern_lookup = {
 		k: [
 			pattern  #
-			for ts in v
-			for pattern in ts.build_enter_exit_patterns(escaped_default_brace_pair)
+			for trigger_sequence in v
+			for pattern in trigger_sequence.build_enter_exit_patterns(escaped_default_brace_pair)
 		]
 		for k, v in suffix_to_trigger_sequence_builders_lookup.items()
 	}
@@ -148,189 +333,9 @@ def wtmpl_eval(
 	else:
 		patterns = LineCommentTriggerSequence("#").build_enter_exit_patterns(escaped_default_brace_pair)
 
-	def _setup_exec_dict() -> dict[str, Any]:
+	root_nodes = Parse__.parse(s, patterns)
 
-		class ShorthandImporter:
-			def __init__(self, current_path: tuple[str, ...] = ()):
-				self.current_path = current_path
-
-			def __call__(self, *last_minute_path_components: str):
-				return __import__(".".join((*self.current_path, *last_minute_path_components)), fromlist=["*"])
-
-			def __getattr__(self, name: str):
-				return object.__getattribute__(self, "__class__")((*self.current_path, name))
-
-			def __getitem__(self, name: str):
-				return object.__getattribute__(self, "__class__")((*self.current_path, name))
-
-		return {
-			"imp": ShorthandImporter(),
-		}
-
-	if True:
-
-		class Node: ...
-
-		@dataclass
-		class TextNode(Node):
-			text: str
-			span: tuple[int, int]
-
-		@dataclass(kw_only=True)
-		class ExprNode(Node):
-			span: tuple[int, int]
-			groupdict: dict[str, str]
-			children: list[Node]
-
-			def get_expr_text(self, s: str) -> str:
-				return s[slice(*self.span)]
-
-		@dataclass
-		class StackEntry:
-			entering_match_span_end: int
-			groupdict: dict[str, str]
-
-		def _parse(s: str, patterns):
-			# stack of node-lists (this creates the tree)
-			node_stack: list[list[Node]] = [[]]
-
-			# stack of open expression metadata
-			expr_stack: list[StackEntry] = []
-
-			i = 0
-			n = len(s)
-
-			while i < n:
-				matched = False
-
-				for enter_pat, exit_pat in patterns:
-					# ---- ENTER ----
-					if m := re.match(enter_pat, s[i:]):
-						i += m.end()
-
-						expr_stack.append(
-							StackEntry(
-								entering_match_span_end=i,
-								groupdict=m.groupdict(),
-							)
-						)
-
-						# new child node list
-						node_stack.append([])
-
-						matched = True
-						break
-
-					# ---- EXIT ----
-					if m := re.match(exit_pat, s[i:]):
-						if not expr_stack:
-							raise ValueError("Unbalanced braces: closed more than opened")
-
-						entry = expr_stack.pop()
-						children = node_stack.pop()
-
-						expr_span = (entry.entering_match_span_end, i)
-
-						node_stack[-1].append(
-							ExprNode(
-								span=expr_span,
-								groupdict=entry.groupdict,
-								children=children,
-							)
-						)
-
-						i += m.end()
-						matched = True
-						break
-
-				if matched:
-					continue
-
-				# ---- TEXT ----
-				# collect continuous text for efficiency
-				text_start = i
-				while i < n:
-					for enter_pat, exit_pat in patterns:
-						if re.match(enter_pat, s[i:]) or re.match(exit_pat, s[i:]):
-							break
-					else:
-						i += 1
-						continue
-					break
-
-				node_stack[-1].append(
-					TextNode(
-						text=s[text_start:i],
-						span=(text_start, i),
-					)
-				)
-
-			if expr_stack:
-				raise ValueError("Unbalanced braces: left opened at end of string")
-
-			return node_stack[0]
-
-	if True:  # eval & highlight errors
-
-		def compile_synthetic(expr: str, src_path: p.Path, mode: str) -> tuple[p.Path, Callable[[], CodeType]]:
-
-			with tempfile.TemporaryDirectory(prefix="wtmpl-inflight-", delete=False) as dir_strpath:
-				src_path = src_path.resolve()
-
-				tmp_file_path = p.Path(dir_strpath) / src_path.relative_to("/").with_name(f"{src_path.name}.py")
-
-				tmp_file_path.parent.mkdir(parents=True)
-
-				tmp_file_path.write_text(
-					f"# {
-						str(src_path).replace('\b', '\\b')  # could be more of the edge cases but i cant think of any
-					}\n{expr}"
-				)
-
-			return tmp_file_path, lambda: compile(f"\n{expr}", filename=str(tmp_file_path), mode=mode)
-
-		def evaluate_node(node: Node, s: str, exec_dict: dict, src_path: p.Path):
-			if isinstance(node, TextNode):
-				return node.text
-			if isinstance(node, ExprNode):
-				pass  # continue on
-			else:
-				raise TypeError(f"Expected Node subclass, got: {node.__class__!r}")
-
-			rendered_children = [evaluate_node(child, s, exec_dict, src_path) for child in node.children]
-
-			expr_source = "".join(rendered_children).strip()
-
-			d = node.groupdict
-
-			if "is_exec" not in d:
-				raise RuntimeError("BUG: missing 'is_exec'")
-
-			is_exec = bool(d["is_exec"])
-			mode = "exec" if is_exec else "eval"
-
-			tmp_file = None
-
-			try:
-				tmp_file, make_compiled = compile_synthetic(expr_source, src_path, mode)
-
-				if is_exec:
-					exec(make_compiled(), exec_dict, exec_dict)
-					retval = exec_dict.get("_", "")
-				else:
-					retval = eval(make_compiled(), exec_dict, exec_dict)
-
-			except BaseException as e:
-				raise error.TemplateArbitrary.BaseError(e) from e
-			else:
-				if tmp_file is not None:
-					tmp_file.unlink(missing_ok=True)
-
-			return str(retval)
-
-	root_nodes = _parse(s, patterns)
-
-	return "".join(evaluate_node(node, s, _setup_exec_dict(), src_path) for node in root_nodes)
+	return "".join(Eval__.evaluate_node(node, s, Eval__.ExecDictItems__.make(), src_path) for node in root_nodes)
 
 
 if False:  # scrap the merge strategy idea, treat everything as `KEEP_ORIGINAL_AND_WARN` by default (and merge directories). Maybe revive this idea in the future...?
