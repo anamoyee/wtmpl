@@ -1,17 +1,14 @@
 import pathlib as __p
 from dataclasses import dataclass as _dataclass
 
-
-class __NoInitMeta(type):
-	def __call__(cls, *args, **kwargs):
-		raise RuntimeError("This class doesnt support initialization, it is a scope for other values only.")
+from nya_scope import Scope
 
 
 class BaseWtmplError(Exception):
 	"""Base class for all wtmpl errors."""
 
 
-class Action(metaclass=__NoInitMeta):
+class Action(Scope):
 	class BaseError(BaseWtmplError):
 		"""Base class for all wtmpl errors which are utility to cause a certain action, for example skip including a file (e.g. DontIncludeError)."""
 
@@ -22,7 +19,7 @@ class Action(metaclass=__NoInitMeta):
 		"""[wtmpl action error]: Dont include this file if this error is raised from a filename or file contents."""
 
 
-class Issue(metaclass=__NoInitMeta):
+class Issue(Scope):
 	class BaseWtmplIssueError(BaseWtmplError):
 		"""Base class for all wtmpl errors which are NOT a utility to cause a certain action, for example skip including a file (e.g. DontIncludeError does NOT inherit from this base class)."""
 
@@ -65,7 +62,7 @@ class Issue(metaclass=__NoInitMeta):
 		requested_name: str
 
 
-class TemplateArbitrary(metaclass=__NoInitMeta):
+class TemplateArbitrary(Scope):
 	class BaseError(BaseWtmplError):
 		"""An exception was raised out of an arbitrary-code part of a template."""
 

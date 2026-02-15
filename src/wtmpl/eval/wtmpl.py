@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, Self
 
 import rich
 from gitignore_parser import parse_gitignore, parse_gitignore_str  # type: ignore
+from nya_scope import Scope
 from rich.markup import escape as esc
 
 from . import error
